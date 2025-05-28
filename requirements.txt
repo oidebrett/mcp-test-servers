@@ -79,3 +79,4 @@ urllib3==2.3.0
 uvicorn==0.30.0
 watchdog==6.0.0
 webencodings==0.5.1
+fastmcp
