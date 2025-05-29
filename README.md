@@ -1,4 +1,5 @@
 # Test-MCP-Servers 
+This repo provides a method to run the test servers from the python sdk.
 
 ## Install
 
@@ -13,8 +14,8 @@ pip install -r requirements.txt
 ## Run
 
 ```bash
-python -m simple-streamablehttp.mcp_simple_streamablehttp --log-level DEBUG --port 8080
-
+#python -m simple-streamablehttp.mcp_simple_streamablehttp --log-level DEBUG --port 8080
+identity-streamablehttp --port 8080
 ```
 
 ## Sync with python sdk
@@ -25,3 +26,5 @@ from https://github.com/modelcontextprotocol/python-sdk/tree/main/examples/serve
 ## Test
 
 Deploy to render.com
+
+![Render](assets/deploytestmcponrender.png)
