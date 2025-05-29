@@ -9,13 +9,21 @@ create a virtual environment and install the requirements
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+cd identity-streamablehttp; pip install -e .;cd ..
+cd identity-streamablehttp; pip install -e .;cd ..
+cd simple-streamablehttp; pip install -e .;cd ..
+cd simple-streamablehttp-stateless; pip install -e .;cd ..
+cd simple-prompt; pip install -e .;cd ..
+cd simple-resource; pip install -e .;cd ..
+cd simple-tool; pip install -e .;cd ..
 ```
 
 ## Run
 
 ```bash
-#python -m simple-streamablehttp.mcp_simple_streamablehttp --log-level DEBUG --port 8080
-identity-streamablehttp --port 8080
+# python -m simple-streamablehttp.mcp_simple_streamablehttp --log-level DEBUG --port 80 - dont use this use this....
+#mcp-simple-streamablehttp --port 8080
+identity-streamablehttp --port 80
 ```
 
 ## Sync with python sdk

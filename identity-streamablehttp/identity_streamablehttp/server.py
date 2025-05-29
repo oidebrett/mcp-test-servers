@@ -1,5 +1,6 @@
 import contextlib
 import logging
+from collections.abc import AsyncIterator
 from http import HTTPStatus
 from uuid import uuid4
 
@@ -7,123 +8,109 @@ import anyio
 import click
 import mcp.types as types
 from mcp.server.lowlevel import Server
-from mcp.server.streamable_http import (
-    MCP_SESSION_ID_HEADER,
-    StreamableHTTPServerTransport,
-)
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from pydantic import AnyUrl
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 from starlette.routing import Mount
+from starlette.types import Receive, Scope, Send
 
 from .event_store import InMemoryEventStore
 
 # Configure logging
 logger = logging.getLogger(__name__)
 
-# Global task group that will be initialized in the lifespan
-task_group = None
+# Store for request headers - use a simple current request approach
+current_request_headers = {}
 
-# Store for request headers
-request_headers = {}
+# Global session manager that will be initialized in the lifespan
+session_manager = None
 
-# Global session ID - we'll use a single session for all requests
-GLOBAL_SESSION_ID = uuid4().hex
 
-# Event store for resumability
-event_store = InMemoryEventStore()
+class HeaderCaptureMiddleware(BaseHTTPMiddleware):
+    """Middleware to capture request headers."""
+    
+    async def dispatch(self, request, call_next):
+        # Store headers from the request with detailed logging
+        headers = dict(request.headers)
+        
+        # Store in both the global current headers and the request state
+        global current_request_headers
+        current_request_headers = headers
+        request.state.headers = headers
+        
+        # Log all headers in detail
+        logger.info(f"MIDDLEWARE: Captured headers: {headers}")
+        for key, value in headers.items():
+            logger.info(f"MIDDLEWARE: Header - {key}: {value}")
+        
+        # Process the request
+        response = await call_next(request)
+        
+        return response
 
 
 @contextlib.asynccontextmanager
-async def lifespan(app):
-    """Application lifespan context manager for managing task group."""
-    global task_group
-
-    async with anyio.create_task_group() as tg:
-        task_group = tg
-        logger.info("Application started, task group initialized!")
-        try:
-            yield
-        finally:
-            logger.info("Application shutting down, cleaning up resources...")
-            if task_group:
-                tg.cancel_scope.cancel()
-                task_group = None
-            logger.info("Resources cleaned up successfully.")
-
-
-@click.command()
-@click.option("--port", default=3000, help="Port to listen on for HTTP")
-@click.option(
-    "--log-level",
-    default="INFO",
-    help="Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)",
-)
-@click.option(
-    "--json-response",
-    is_flag=True,
-    default=False,
-    help="Enable JSON responses instead of SSE streams",
-)
-def main(
-    port: int,
-    log_level: str,
-    json_response: bool,
-) -> int:
-    # Configure logging
-    logging.basicConfig(
-        level=getattr(logging, log_level.upper()),
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    )
-
-    app = Server("identity-streamablehttp-demo")
-
-    @app.call_tool()
+async def lifespan(app: Starlette) -> AsyncIterator[None]:
+    """Context manager for session manager."""
+    global session_manager
+    
+    # Create the MCP server
+    mcp_app = Server("identity-streamablehttp-demo")
+    
+    @mcp_app.call_tool()
     async def call_tool(
         name: str, arguments: dict
     ) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
-        ctx = app.request_context
+        ctx = mcp_app.request_context
         
-        # Use the global session ID
-        session_id = GLOBAL_SESSION_ID
+        # Debug logging for request context
+        logger.info(f"TOOL: Request context: {ctx}")
+        logger.info(f"TOOL: MCP Request ID from context: {ctx.request_id}")
+        
+        # Get headers from the global current request headers
+        # This works because each request is processed synchronously
+        headers = current_request_headers.copy()
+        logger.info(f"TOOL: Current request headers: {headers}")
         
         if name == "get_logged_in_user":
-            # Get headers for this session
-            if session_id in request_headers:
-                headers = request_headers[session_id]
-                # Headers are case-insensitive
-                header_name = "X-Forwarded-User".lower()
-                for key, value in headers.items():
-                    if key.lower() == header_name:
-                        return [types.TextContent(type="text", text=value)]
-                return [types.TextContent(type="text", text="Not logged in")]
-            else:
-                return [types.TextContent(type="text", text="No headers found for session")]
+            # Headers are case-insensitive
+            header_name = "X-Forwarded-User".lower()
+            logger.info(f"TOOL: Looking for header: {header_name}")
+            for key, value in headers.items():
+                logger.info(f"TOOL: Checking header {key.lower()} against {header_name}")
+                if key.lower() == header_name:
+                    logger.info(f"TOOL: Found header {key} with value {value}")
+                    return [types.TextContent(type="text", text=value)]
+            logger.info("TOOL: X-Forwarded-User header not found, returning 'Not logged in'")
+            return [types.TextContent(type="text", text="Not logged in")]
         
         elif name == "get_request_headers":
-            # Return all headers for this session
-            if session_id in request_headers:
-                headers_text = "\n".join([f"{k}: {v}" for k, v in request_headers[session_id].items()])
-                return [types.TextContent(type="text", text=headers_text)]
+            # Return all headers for this request
+            headers_text = "\n".join([f"{k}: {v}" for k, v in headers.items()])
+            if not headers_text:
+                headers_text = "No headers found for request"
+                logger.info(f"TOOL: {headers_text}")
             else:
-                return [types.TextContent(type="text", text="No headers found for session")]
+                logger.info(f"TOOL: Found headers:\n{headers_text}")
+            return [types.TextContent(type="text", text=headers_text)]
         
         elif name == "get_header":
             header_name = arguments.get("header_name", "")
             if not header_name:
                 return [types.TextContent(type="text", text="Missing header_name argument")]
             
-            if session_id in request_headers:
-                headers = request_headers[session_id]
-                # Headers are case-insensitive
-                header_name = header_name.lower()
-                for key, value in headers.items():
-                    if key.lower() == header_name:
-                        return [types.TextContent(type="text", text=value)]
-                return [types.TextContent(type="text", text="Not found")]
-            else:
-                return [types.TextContent(type="text", text="No headers found for session")]
+            # Headers are case-insensitive
+            header_name_lower = header_name.lower()
+            for key, value in headers.items():
+                if key.lower() == header_name_lower:
+                    logger.info(f"TOOL: Found header {key} with value {value}")
+                    return [types.TextContent(type="text", text=value)]
+            logger.info(f"TOOL: Header {header_name} not found")
+            return [types.TextContent(type="text", text="Not found")]
         
         elif name == "start-notification-stream":
             interval = arguments.get("interval", 1.0)
@@ -159,7 +146,7 @@ def main(
         else:
             return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
 
-    @app.list_tools()
+    @mcp_app.list_tools()
     async def list_tools() -> list[types.Tool]:
         return [
             types.Tool(
@@ -221,56 +208,90 @@ def main(
             )
         ]
 
-    # We need to store the server instances between requests
-    server_instances = {}
-    # Lock to prevent race conditions when creating new sessions
-    session_creation_lock = anyio.Lock()
+    # Create the session manager with stateless mode
+    session_manager = StreamableHTTPSessionManager(
+        app=mcp_app,
+        event_store=InMemoryEventStore(),  # Keep event store for resumability
+        json_response=app.state.json_response,
+        stateless=True,  # Enable stateless mode
+    )
+    
+    # Start the session manager
+    async with session_manager.run():
+        logger.info("Application started with stateless StreamableHTTP session manager!")
+        try:
+            yield
+        finally:
+            logger.info("Application shutting down...")
 
-    # ASGI handler for streamable HTTP connections
-    async def handle_streamable_http(scope, receive, send):
+
+@click.command()
+@click.option("--port", default=3000, help="Port to listen on for HTTP")
+@click.option(
+    "--log-level",
+    default="INFO",
+    help="Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)",
+)
+@click.option(
+    "--json-response",
+    is_flag=True,
+    default=False,
+    help="Enable JSON responses instead of SSE streams",
+)
+def main(
+    port: int,
+    log_level: str,
+    json_response: bool,
+) -> int:
+    # Configure logging
+    logging.basicConfig(
+        level=getattr(logging, log_level.upper()),
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+
+    async def handle_streamable_http(
+        scope: Scope, receive: Receive, send: Send
+    ) -> None:
+        # Get the request
         request = Request(scope, receive)
-        request_mcp_session_id = request.headers.get(MCP_SESSION_ID_HEADER)
         
-        # Always use our global session ID
-        session_id = GLOBAL_SESSION_ID
+        logger.info(f"HANDLER: Processing request")
         
-        # Store headers for this request
-        request_headers[session_id] = dict(request.headers)
-        logger.debug(f"Updated headers for global session {session_id}")
-        
-        if session_id in server_instances:
-            transport = server_instances[session_id]
-            logger.debug("Session already exists, handling request directly")
-            await transport.handle_request(scope, receive, send)
-        else:
-            # Create a new transport with our global session ID
-            logger.debug("Creating new transport with global session ID")
-            http_transport = StreamableHTTPServerTransport(
-                mcp_session_id=session_id,
-                is_json_response_enabled=json_response,
-                event_store=event_store,  # Enable resumability
-            )
-            server_instances[session_id] = http_transport
-            logger.info(f"Created new transport with global session ID: {session_id}")
-
-            async def run_server(task_status=None):
-                async with http_transport.connect() as streams:
-                    read_stream, write_stream = streams
-                    if task_status:
-                        task_status.started()
-                    await app.run(
-                        read_stream,
-                        write_stream,
-                        app.create_initialization_options(),
-                    )
-
-            if not task_group:
-                raise RuntimeError("Task group is not initialized")
-
-            await task_group.start(run_server)
-
-            # Handle the HTTP request and return the response
-            await http_transport.handle_request(scope, receive, send)
+        try:
+            # Handle the request using the global session manager
+            if session_manager:
+                logger.info(f"HANDLER: Passing request to session manager")
+                await session_manager.handle_request(scope, receive, send)
+                logger.info(f"HANDLER: Request completed successfully")
+            else:
+                logger.error("HANDLER: Session manager not initialized")
+                await send({
+                    "type": "http.response.start",
+                    "status": 500,
+                    "headers": [(b"content-type", b"text/plain")],
+                })
+                await send({
+                    "type": "http.response.body",
+                    "body": b"Internal server error: Session manager not initialized",
+                })
+        except Exception as e:
+            logger.error(f"HANDLER: Error handling request: {str(e)}")
+            import traceback
+            logger.error(f"HANDLER: Traceback: {traceback.format_exc()}")
+            
+            # Try to send an error response
+            try:
+                await send({
+                    "type": "http.response.start",
+                    "status": 500,
+                    "headers": [(b"content-type", b"text/plain")],
+                })
+                await send({
+                    "type": "http.response.body",
+                    "body": f"Internal server error: {str(e)}".encode("utf-8"),
+                })
+            except Exception as send_error:
+                logger.error(f"HANDLER: Failed to send error response: {str(send_error)}")
 
     # Create an ASGI application using the transport
     starlette_app = Starlette(
@@ -278,8 +299,14 @@ def main(
         routes=[
             Mount("/mcp", app=handle_streamable_http),
         ],
+        middleware=[
+            Middleware(HeaderCaptureMiddleware),
+        ],
         lifespan=lifespan,
     )
+    
+    # Store json_response in app state for access in lifespan
+    starlette_app.state.json_response = json_response
 
     import uvicorn
 
